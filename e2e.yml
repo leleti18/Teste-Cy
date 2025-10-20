@@ -1,0 +1,118 @@
+name: E2E via Cypress (Lovable)
+
+on:
+  workflow_dispatch:
+    inputs:
+      run_id:
+        description: "ID do test_run"
+        required: true
+        type: string
+
+jobs:
+  e2e:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout (repo vazio serve)
+        uses: actions/checkout@v4
+
+      - name: Instalar Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Instalar Cypress
+        run: |
+          npm init -y
+          npm install cypress@13 jq -D
+
+      - name: Buscar payload do run no Lovable
+        env:
+          API_URL: ${{ secrets.API_URL }}
+          API_BEARER_TOKEN: ${{ secrets.API_BEARER_TOKEN }}
+          RUN_ID: ${{ github.event.inputs.run_id }}
+        run: |
+          curl -sS -H "Authorization: Bearer $API_BEARER_TOKEN" \
+            "$API_URL/api/test-runs/$RUN_ID" > run.json
+
+          # Validação básica
+          cat run.json | jq . > /dev/null
+
+      - name: Gerar projeto Cypress (config + spec)
+        env:
+          BASE_URL_DEFAULT: ${{ secrets.BASE_URL_DEFAULT }}
+        run: |
+          mkdir -p cypress/e2e
+
+          # Extrair baseUrl do payload se existir (env.BASE_URL), senão usa BASE_URL_DEFAULT
+          BASE_URL=$(jq -r '.env.BASE_URL // empty' run.json)
+          if [ -z "$BASE_URL" ]; then BASE_URL="$BASE_URL_DEFAULT"; fi
+          if [ -z "$BASE_URL" ]; then BASE_URL="http://localhost:3000"; fi
+
+          cat > cypress.config.js <<EOF
+          const { defineConfig } = require('cypress');
+          module.exports = defineConfig({
+            e2e: {
+              baseUrl: '$BASE_URL',
+            },
+            video: true,
+            screenshotsFolder: 'cypress/screenshots',
+            videosFolder: 'cypress/videos',
+          });
+          EOF
+
+          # Constrói a spec a partir de run.json
+          node - <<'NODE'
+          const fs = require('fs');
+          const run = JSON.parse(fs.readFileSync('run.json','utf8'));
+          const test = run.test || {};
+          const steps = Array.isArray(run.steps) ? run.steps : [];
+
+          const esc = s => String(s ?? '').replace(/'/g,"\\'");
+          const toLine = s => {
+            switch (s.type) {
+              case 'visit':       return `cy.visit('${esc(s.url)}');`;
+              case 'click':       return `cy.get('${esc(s.selector)}').click();`;
+              case 'type':        return `cy.get('${esc(s.selector)}').clear().type('${esc(s.value)}');`;
+              case 'assert_text': return s.value === 'exists'
+                ? `cy.get('${esc(s.selector)}').should('exist');`
+                : `cy.get('${esc(s.selector)}').should('contain', '${esc(s.value)}');`;
+              case 'assert_url':
+                if (String(s.value||'').startsWith('contains:')) {
+                  const frag = String(s.value).replace('contains:','');
+                  return `cy.url().should('contain', '${esc(frag)}');`;
+                }
+                return `cy.url().should('eq', '${esc(s.value)}');`;
+              case 'wait':        return `cy.wait(${Number(s.wait_ms || 500)});`;
+              case 'custom':      return s.custom_code || `// custom`;
+              default:            return `// tipo não suportado: ${s.type}`;
+            }
+          };
+
+          const body = `export {};
+          describe('${esc(test.title || 'Cenário')}', () => {
+            it('${esc(test.description || 'Fluxo principal')}', () => {
+              ${steps.map(toLine).join('\n              ')}
+            });
+          });`;
+
+          fs.writeFileSync('cypress/e2e/generated.cy.js', body, 'utf8');
+          NODE
+
+      - name: Rodar Cypress
+        run: npx cypress run --browser chrome
+
+      - name: Enviar resultado para o Lovable
+        if: always()
+        env:
+          RESULTS_WEBHOOK_URL: ${{ secrets.RESULTS_WEBHOOK_URL }}
+          API_BEARER_TOKEN: ${{ secrets.API_BEARER_TOKEN }}
+          RUN_ID: ${{ github.event.inputs.run_id }}
+          JOB_STATUS: ${{ job.status }} # success | failure | cancelled
+        run: |
+          STATUS="failed"
+          if [ "$JOB_STATUS" = "success" ]; then STATUS="passed"; fi
+          curl -sS -X POST "$RESULTS_WEBHOOK_URL" \
+            -H "Authorization: Bearer $API_BEARER_TOKEN" \
+            -H "Content-Type: application/json" \
+            -d "{\"run_id\":\"$RUN_ID\",\"status\":\"$STATUS\",\"artifacts\":{}}"
